@@ -7,8 +7,9 @@ class ConsoleNotifier implements INotifier {
   async notify(n: SwapNotification): Promise<void> {
     console.log(`\n[NOTIFICATION] Swap ${n.swapId} — ${n.outcome.toUpperCase()}`);
     console.log(`  Requested : block ${n.requested.blockNumber}, ${n.requested.amountIn} ${n.requested.tokenIn} → ${n.requested.tokenOut}`);
-    console.log(`  Locked    : block ${n.fundsLocked.blockNumber}`);
-    console.log(`  Settled   : block ${n.settled.blockNumber}, out=${n.settled.amountOut}`);
+    if (n.fundsLocked) console.log(`  Locked    : block ${n.fundsLocked.blockNumber}`);
+    if (n.settled) console.log(`  Settled   : block ${n.settled.blockNumber}, out=${n.settled.amountOut}`);
+    if (n.reason) console.log(`  Reason    : ${n.reason}`);
   }
 }
 

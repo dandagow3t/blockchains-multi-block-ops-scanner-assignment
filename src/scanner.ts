@@ -14,9 +14,10 @@ import {
   IBlockchainNode,
   INotifier,
   RawLog,
+  SwapEvent,
   SwapNotification,
   SwapRequestedEvent,
-  SwapSettledEvent,
+  TerminalSwapEvent,
 } from './types';
 
 // Contract address the scanner listens to
@@ -103,7 +104,7 @@ export interface ScannerOptions {
 
 // ── Event parsing ─────────────────────────────────────────────────────────────
 
-function parseLog(log: RawLog, blockNumber: number): SwapRequestedEvent | FundsLockedEvent | SwapSettledEvent | null {
+function parseLog(log: RawLog, blockNumber: number, logger: ILogger): SwapEvent | null {
   if (log.address !== VAULT_SWAP_CONTRACT) return null;
 
   const txHash = String(log.args['txHash'] ?? '');
@@ -129,15 +130,63 @@ function parseLog(log: RawLog, blockNumber: number): SwapRequestedEvent | FundsL
         blockNumber,
         txHash,
       };
-    case 'SwapSettled':
+    case 'SwapSettled': {
+      const swapId = String(log.args['swapId']);
+      const status = log.args['status'];
+      // Do NOT coerce an unrecognised status to 'filled'. A bogus status that
+      // silently became a *successful fill* is the dangerous direction in a
+      // financial system: better to drop the malformed settle (the swap stays
+      // pending and the warning is visible) than to emit a false settlement.
+      if (status !== 'filled' && status !== 'expired') {
+        logger.warn(
+          `SwapSettled for ${swapId} at block ${blockNumber} has unrecognised ` +
+            `status "${String(status)}"; skipping this log.`,
+        );
+        return null;
+      }
       return {
         type: 'SwapSettled',
-        swapId: String(log.args['swapId']),
+        swapId,
         amountOut: String(log.args['amountOut']),
-        status: log.args['status'] === 'expired' ? 'expired' : 'filled',
+        status,
         blockNumber,
         txHash,
       };
+    }
+    case 'FundsLockFailed':
+      return {
+        type: 'FundsLockFailed',
+        swapId: String(log.args['swapId']),
+        vault: String(log.args['vault'] ?? ''),
+        reason: String(log.args['reason'] ?? ''),
+        blockNumber,
+        txHash,
+      };
+    case 'SwapCancelled': {
+      const swapId = String(log.args['swapId']);
+      const rawBy = log.args['by'];
+      // Attribution-only field: a cancel with an unrecognised `by` is still a
+      // real cancellation, so we keep it but record 'unknown' rather than
+      // mis-attributing it to the user.
+      let by: 'user' | 'protocol' | 'unknown';
+      if (rawBy === 'user' || rawBy === 'protocol') {
+        by = rawBy;
+      } else {
+        logger.warn(
+          `SwapCancelled for ${swapId} at block ${blockNumber} has unrecognised ` +
+            `'by' value "${String(rawBy)}"; recording as 'unknown'.`,
+        );
+        by = 'unknown';
+      }
+      return {
+        type: 'SwapCancelled',
+        swapId,
+        by,
+        reason: String(log.args['reason'] ?? ''),
+        blockNumber,
+        txHash,
+      };
+    }
     default:
       return null;
   }
@@ -314,18 +363,29 @@ export class VaultSwapScanner {
   // ── Per-block processing ──────────────────────────────────────────────────
 
   private async processBlock(block: Block): Promise<void> {
-    for (const rawLog of block.logs) {
-      const event = parseLog(rawLog, block.number);
-      if (!event) continue;
+    const events = block.logs
+      .map((rawLog) => parseLog(rawLog, block.number, this.log))
+      .filter((event): event is SwapEvent => event !== null);
 
-      switch (event.type) {
-        case 'SwapRequested':
-        case 'FundsLocked':
-          await this.recordPartial(event);
-          break;
-        case 'SwapSettled':
-          await this.handleSettled(event);
-          break;
+    // Two passes within the block. A swap's events are causally ordered ACROSS
+    // blocks (it cannot settle before it locks), but the order of logs WITHIN a
+    // single block is not guaranteed to respect that. Recording partials
+    // (SwapRequested / FundsLocked) before handling terminals makes correlation
+    // independent of intra-block log ordering: a terminal that shares a block
+    // with its own prerequisite still sees it, instead of failing to correlate
+    // and deleting the swap's anchor — which would lose the swap permanently.
+    for (const event of events) {
+      if (event.type === 'SwapRequested' || event.type === 'FundsLocked') {
+        await this.recordPartial(event);
+      }
+    }
+    for (const event of events) {
+      if (
+        event.type === 'SwapSettled' ||
+        event.type === 'FundsLockFailed' ||
+        event.type === 'SwapCancelled'
+      ) {
+        await this.handleTerminal(event);
       }
     }
   }
@@ -344,41 +404,28 @@ export class VaultSwapScanner {
     await this.store.putPending(event.swapId, state);
   }
 
-  private async handleSettled(event: SwapSettledEvent): Promise<void> {
+  /**
+   * Handle any terminal event (SwapSettled / FundsLockFailed / SwapCancelled).
+   * The first terminal event seen for a swap finalises it; the swap is then
+   * sealed by the notified-set, so any later terminal (e.g. a settle racing a
+   * cancel) or straggler partial is ignored.
+   */
+  private async handleTerminal(event: TerminalSwapEvent): Promise<void> {
     // Dedupe: never emit twice for the same swap, even across restarts.
     if (await this.store.isNotified(event.swapId)) {
-      this.log.warn(`Duplicate SwapSettled for ${event.swapId} ignored.`);
+      this.log.warn(`Duplicate terminal event (${event.type}) for ${event.swapId} ignored; swap already finalised.`);
       return;
     }
 
-    const state = await this.store.getPending(event.swapId);
+    const state = (await this.store.getPending(event.swapId)) ?? {};
+    const notification = this.correlate(event, state);
 
-    if (!state?.requested || !state?.fundsLocked) {
-      // Incomplete correlation, usually because the scan started mid-swap
-      // (start at block 500, swap requested at 490). The earlier events were
-      // never seen, so a complete SwapNotification can't be built (its
-      // requested/fundsLocked fields are required). Log and drop rather than
-      // emit a partial notification. Backfilling the earlier blocks is the
-      // production fix; see NOTES.md.
-      const missing = [
-        state?.requested ? null : 'SwapRequested',
-        state?.fundsLocked ? null : 'FundsLocked',
-      ].filter(Boolean);
-      this.log.warn(
-        `SwapSettled for ${event.swapId} at block ${event.blockNumber} cannot be ` +
-          `correlated (missing ${missing.join(', ')}); skipping notification.`,
-      );
+    if (!notification) {
+      // Could not be correlated (reason already logged in correlate()). Drop any
+      // partial state so it does not linger as a never-completing swap.
       await this.store.deletePending(event.swapId);
       return;
     }
-
-    const notification: SwapNotification = {
-      swapId: event.swapId,
-      outcome: event.status,
-      requested: state.requested,
-      fundsLocked: state.fundsLocked,
-      settled: event,
-    };
 
     // At-least-once: notify first, then mark + clean up. A crash between
     // notify() and markNotified() re-emits this one notification on restart,
@@ -396,7 +443,76 @@ export class VaultSwapScanner {
     await this.store.markNotified(event.swapId, event.blockNumber);
     await this.store.deletePending(event.swapId);
 
-    this.log.info(`Emitted notification for ${event.swapId} (${event.status}).`);
+    this.log.info(`Emitted notification for ${event.swapId} (${notification.outcome}).`);
+  }
+
+  /**
+   * Build the notification for a terminal event, or null if it can't be
+   * correlated and should be skipped.
+   *
+   * Every terminal needs the SwapRequested as its correlation anchor; without it
+   * we usually started the scan mid-swap (start at block 500, requested at 490)
+   * and can't produce a useful notification. Backfill is the production fix; see
+   * NOTES.md. SwapSettled additionally requires FundsLocked, so a filled/expired
+   * notification always carries its full three-step provenance — a missing lock
+   * there signals a real gap. lock_failed / cancelled need only the request,
+   * because a missing lock is the expected shape for those outcomes.
+   */
+  private correlate(event: TerminalSwapEvent, state: SwapState): SwapNotification | null {
+    if (!state.requested) {
+      this.log.warn(
+        `${event.type} for ${event.swapId} at block ${event.blockNumber} has no prior ` +
+          `SwapRequested (likely started mid-swap); skipping notification.`,
+      );
+      return null;
+    }
+
+    switch (event.type) {
+      case 'SwapSettled':
+        if (!state.fundsLocked) {
+          this.log.warn(
+            `SwapSettled for ${event.swapId} at block ${event.blockNumber} cannot be ` +
+              `correlated (missing FundsLocked); skipping notification.`,
+          );
+          return null;
+        }
+        return {
+          swapId: event.swapId,
+          outcome: event.status,
+          requested: state.requested,
+          fundsLocked: state.fundsLocked,
+          settled: event,
+          terminal: event,
+        };
+
+      case 'FundsLockFailed':
+        return {
+          swapId: event.swapId,
+          outcome: 'lock_failed',
+          requested: state.requested,
+          terminal: event,
+          reason: event.reason,
+        };
+
+      case 'SwapCancelled':
+        return {
+          swapId: event.swapId,
+          outcome: 'cancelled',
+          requested: state.requested,
+          // Present only if the funds were locked before the cancel landed.
+          ...(state.fundsLocked ? { fundsLocked: state.fundsLocked } : {}),
+          terminal: event,
+          reason: event.reason,
+        };
+
+      default: {
+        // Exhaustiveness guard: if a new TerminalSwapEvent variant is added to
+        // the union but not handled here, this fails to compile. At runtime it
+        // also refuses to silently drop the event.
+        const unhandled: never = event;
+        throw new Error(`Unhandled terminal event type: ${JSON.stringify(unhandled)}`);
+      }
+    }
   }
 }
 

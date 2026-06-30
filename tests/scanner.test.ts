@@ -1,12 +1,19 @@
-import { VaultSwapScanner, ScannerOptions, ILogger, ReorgDetectedError } from '../src/scanner';
 import { SimulatedNode } from '../src/node';
-import { InMemoryScannerStore } from '../src/store';
 import { RetryOptions } from '../src/retry';
 import {
+  ILogger,
+  ReorgDetectedError,
+  ScannerOptions,
+  VaultSwapScanner,
+} from '../src/scanner';
+import { InMemoryScannerStore } from '../src/store';
+import {
   Block,
+  FundsLockFailedEvent,
   IBlockchainNode,
   INotifier,
   RawLog,
+  SwapCancelledEvent,
   SwapNotification,
 } from '../src/types';
 
@@ -174,6 +181,31 @@ function settledLog(
   };
 }
 
+function lockFailedLog(
+  swapId: string,
+  reason = 'insufficient_liquidity',
+  over: Record<string, string> = {},
+): RawLog {
+  return {
+    address: CONTRACT,
+    event: 'FundsLockFailed',
+    args: { txHash: nextTx(), swapId, vault: '0xVault1', reason, ...over },
+  };
+}
+
+function cancelledLog(
+  swapId: string,
+  by: 'user' | 'protocol' = 'user',
+  reason = 'user_request',
+  over: Record<string, string> = {},
+): RawLog {
+  return {
+    address: CONTRACT,
+    event: 'SwapCancelled',
+    args: { txHash: nextTx(), swapId, by, reason, ...over },
+  };
+}
+
 /** A self-contained 3-block swap starting at `from`: requested, locked, settled. */
 function happyPath(swapId: string, from: number, status: 'filled' | 'expired' = 'filled'): Block[] {
   return [
@@ -322,7 +354,7 @@ describe('incomplete operations', () => {
     await makeScanner(node, notifier, { logger }).start();
 
     expect(notifier.notifications).toHaveLength(0);
-    expect(logger.warns.some((m) => m.includes('orphan') && m.includes('cannot be'))).toBe(true);
+    expect(logger.warns.some((m) => m.includes('orphan') && m.includes('skipping'))).toBe(true);
   });
 
   test('startBlock is inclusive: a swap that began before it is seen only at its settle, then dropped', async () => {
@@ -730,5 +762,251 @@ describe('idle behaviour', () => {
     await makeScanner(node, notifier).start();
 
     expect(notifier.notifications).toHaveLength(0);
+  });
+});
+
+describe('early termination (Part 3)', () => {
+  test('emits a lock_failed notification when the vault fails to lock funds', async () => {
+    const notifier = new CapturingNotifier();
+    const node = new SimulatedNode([
+      block(1, [requestedLog('swap-lf')]),
+      block(2, [lockFailedLog('swap-lf', 'insufficient_liquidity')]),
+    ]);
+
+    await makeScanner(node, notifier).start();
+
+    expect(notifier.notifications).toHaveLength(1);
+    const n = notifier.notifications[0];
+    expect(n.outcome).toBe('lock_failed');
+    expect(n.reason).toBe('insufficient_liquidity');
+    expect(n.requested.swapId).toBe('swap-lf');
+    expect(n.fundsLocked).toBeUndefined(); // funds never locked
+    expect(n.settled).toBeUndefined(); // never settled
+  });
+
+  test('emits a cancelled notification when a swap is cancelled before funds are locked', async () => {
+    const notifier = new CapturingNotifier();
+    const node = new SimulatedNode([
+      block(1, [requestedLog('swap-c1')]),
+      block(2, [cancelledLog('swap-c1', 'user', 'user_request')]),
+    ]);
+
+    await makeScanner(node, notifier).start();
+
+    expect(notifier.notifications).toHaveLength(1);
+    expect(notifier.notifications[0]).toMatchObject({
+      swapId: 'swap-c1',
+      outcome: 'cancelled',
+      reason: 'user_request',
+    });
+    expect(notifier.notifications[0].fundsLocked).toBeUndefined();
+  });
+
+  test('includes fundsLocked when a swap is cancelled after the funds were locked', async () => {
+    const notifier = new CapturingNotifier();
+    const node = new SimulatedNode([
+      block(1, [requestedLog('swap-c2')]),
+      block(2, [lockedLog('swap-c2')]),
+      block(3, [cancelledLog('swap-c2', 'protocol', 'timeout')]),
+    ]);
+
+    await makeScanner(node, notifier).start();
+
+    expect(notifier.notifications).toHaveLength(1);
+    const n = notifier.notifications[0];
+    expect(n.outcome).toBe('cancelled');
+    expect(n.fundsLocked).toMatchObject({ swapId: 'swap-c2', blockNumber: 2 });
+  });
+
+  test('the first terminal event seals the swap (a settle racing a cancel does not double-notify)', async () => {
+    const notifier = new CapturingNotifier();
+    const node = new SimulatedNode([
+      block(1, [requestedLog('swap-race')]),
+      block(2, [lockedLog('swap-race')]),
+      block(3, [cancelledLog('swap-race', 'user', 'user_request')]),
+      block(4, [settledLog('swap-race', 'filled')]), // late settle after the cancel
+    ]);
+
+    await makeScanner(node, notifier).start();
+
+    expect(notifier.notifications).toHaveLength(1);
+    expect(notifier.notifications[0].outcome).toBe('cancelled'); // first terminal wins
+  });
+
+  test('a settle still requires FundsLocked: a settle with no observed lock is dropped', async () => {
+    const notifier = new CapturingNotifier();
+    const logger = new RecordingLogger();
+    const node = new SimulatedNode([
+      block(1, [requestedLog('swap-nolock')]),
+      block(2, [settledLog('swap-nolock', 'filled')]), // requested, but never locked
+    ]);
+
+    await makeScanner(node, notifier, { logger }).start();
+
+    expect(notifier.notifications).toHaveLength(0);
+    expect(logger.warns.some((m) => m.includes('swap-nolock') && m.includes('FundsLocked'))).toBe(true);
+  });
+
+  test('drops an early-termination event that has no observed request (started mid-swap)', async () => {
+    const notifier = new CapturingNotifier();
+    const node = new SimulatedNode([block(1, [lockFailedLog('swap-orphan')])]);
+
+    await makeScanner(node, notifier).start();
+
+    expect(notifier.notifications).toHaveLength(0);
+  });
+
+  test('does not re-emit an early-termination notification after restart', async () => {
+    const store = new InMemoryScannerStore();
+    const node = new SimulatedNode([
+      block(1, [requestedLog('swap-dedupe')]),
+      block(2, [cancelledLog('swap-dedupe')]),
+    ]);
+
+    await makeScanner(node, new CapturingNotifier(), { store }).start();
+
+    const second = new CapturingNotifier();
+    await makeScanner(node, second, { store }).start();
+    expect(second.notifications).toHaveLength(0);
+  });
+});
+
+describe('notification completeness & input validation (Part 3)', () => {
+  // A — the terminating event is surfaced on every outcome, not only on settled,
+  // so a consumer can always locate the on-chain ending and read its fields.
+  test('lock_failed notification carries the terminating event (block, tx, vault)', async () => {
+    const notifier = new CapturingNotifier();
+    const node = new SimulatedNode([
+      block(1, [requestedLog('swap-A1')]),
+      block(2, [lockFailedLog('swap-A1', 'insufficient_liquidity')]),
+    ]);
+
+    await makeScanner(node, notifier).start();
+
+    const n = notifier.notifications[0];
+    expect(n.terminal.type).toBe('FundsLockFailed');
+    expect(n.terminal.blockNumber).toBe(2);
+    expect(n.terminal.txHash).toBeTruthy();
+    expect((n.terminal as FundsLockFailedEvent).vault).toBe('0xVault1');
+    expect((n.terminal as FundsLockFailedEvent).reason).toBe('insufficient_liquidity');
+  });
+
+  test('cancelled notification preserves who cancelled via the terminating event', async () => {
+    const notifier = new CapturingNotifier();
+    const node = new SimulatedNode([
+      block(1, [requestedLog('swap-A2')]),
+      block(2, [cancelledLog('swap-A2', 'protocol', 'risk_hold')]),
+    ]);
+
+    await makeScanner(node, notifier).start();
+
+    const n = notifier.notifications[0];
+    expect(n.terminal.type).toBe('SwapCancelled');
+    expect((n.terminal as SwapCancelledEvent).by).toBe('protocol');
+    expect(n.terminal.blockNumber).toBe(2);
+    expect(n.terminal.txHash).toBeTruthy();
+  });
+
+  test('for a filled swap, terminal is the same object as settled', async () => {
+    const notifier = new CapturingNotifier();
+    const node = new SimulatedNode(happyPath('swap-A3', 1));
+
+    await makeScanner(node, notifier).start();
+
+    const n = notifier.notifications[0];
+    expect(n.terminal.type).toBe('SwapSettled');
+    expect(n.terminal).toBe(n.settled); // same reference
+  });
+
+  // B — unsafe enum coercion removed.
+  test('an unrecognised settle status is dropped, never coerced to "filled"', async () => {
+    const notifier = new CapturingNotifier();
+    const logger = new RecordingLogger();
+    const node = new SimulatedNode([
+      block(1, [requestedLog('swap-B1')]),
+      block(2, [lockedLog('swap-B1')]),
+      block(3, [settledLog('swap-B1', 'filled', { status: 'bogus' })]), // garbage status
+    ]);
+
+    await makeScanner(node, notifier, { logger }).start();
+
+    expect(notifier.notifications).toHaveLength(0); // NOT a false 'filled'
+    expect(
+      logger.warns.some((m) => m.includes('swap-B1') && m.includes('unrecognised status')),
+    ).toBe(true);
+  });
+
+  test('an unrecognised cancel "by" is recorded as "unknown", not mis-attributed to the user', async () => {
+    const notifier = new CapturingNotifier();
+    const logger = new RecordingLogger();
+    const node = new SimulatedNode([
+      block(1, [requestedLog('swap-B2')]),
+      block(2, [cancelledLog('swap-B2', 'user', 'odd', { by: 'bot' })]), // garbage 'by'
+    ]);
+
+    await makeScanner(node, notifier, { logger }).start();
+
+    expect(notifier.notifications).toHaveLength(1);
+    expect((notifier.notifications[0].terminal as SwapCancelledEvent).by).toBe('unknown');
+    expect(logger.warns.some((m) => m.includes('swap-B2') && m.includes('unknown'))).toBe(true);
+  });
+});
+
+describe('intra-block log ordering', () => {
+  // C — correlation must not depend on the order of logs within a block. A
+  // terminal positioned before its own prerequisite in the same block must still
+  // correlate, rather than dropping the swap and erasing its anchor.
+
+  test('a SwapSettled placed before its FundsLocked in the same block still correlates', async () => {
+    const notifier = new CapturingNotifier();
+    const node = new SimulatedNode([
+      block(1, [requestedLog('swap-ord')]),
+      // settle log sits BEFORE the lock log in the same block
+      block(2, [settledLog('swap-ord', 'filled'), lockedLog('swap-ord')]),
+    ]);
+
+    await makeScanner(node, notifier).start();
+
+    expect(notifier.notifications).toHaveLength(1);
+    expect(notifier.notifications[0]).toMatchObject({
+      swapId: 'swap-ord',
+      outcome: 'filled',
+      fundsLocked: { blockNumber: 2 },
+      settled: { blockNumber: 2 },
+    });
+  });
+
+  test('all three events in one block, terminal-first, still correlate', async () => {
+    const notifier = new CapturingNotifier();
+    const node = new SimulatedNode([
+      // fully reversed order within the block: settled, locked, requested
+      block(1, [
+        settledLog('swap-rev', 'filled'),
+        lockedLog('swap-rev'),
+        requestedLog('swap-rev'),
+      ]),
+    ]);
+
+    await makeScanner(node, notifier).start();
+
+    expect(notifier.notifications).toHaveLength(1);
+    expect(notifier.notifications[0].swapId).toBe('swap-rev');
+  });
+
+  test('a cancel before its lock in the same block still captures the lock', async () => {
+    const notifier = new CapturingNotifier();
+    const node = new SimulatedNode([
+      block(1, [requestedLog('swap-cl')]),
+      // cancel log before the lock log; the lock is recorded first, so it is
+      // included in the cancellation notification.
+      block(2, [cancelledLog('swap-cl', 'user', 'user_request'), lockedLog('swap-cl')]),
+    ]);
+
+    await makeScanner(node, notifier).start();
+
+    expect(notifier.notifications).toHaveLength(1);
+    const n = notifier.notifications[0];
+    expect(n.outcome).toBe('cancelled');
+    expect(n.fundsLocked).toMatchObject({ blockNumber: 2 });
   });
 });

@@ -308,6 +308,11 @@ async outbox delivery, with lag as the signal for when to scale.
 - Out-of-order partials within range (`FundsLocked` before `SwapRequested`):
   whichever arrives first is stored; correlation only needs both present by settle
   time.
+- Intra-block log ordering: a block is processed in two passes (record all
+  partials, then handle all terminals), so a terminal log positioned before its
+  own prerequisite *in the same block* still correlates instead of dropping the
+  swap. Across blocks, ordering is assumed causal — a swap cannot settle in an
+  earlier block than it locked.
 - Transient node errors: retried with exponential backoff; exhaustion re-throws
   so the run fails loudly instead of dropping a block.
 - Already caught up: `start()` is a no-op when `safeTip <= checkpoint`.
