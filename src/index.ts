@@ -15,7 +15,8 @@ class ConsoleNotifier implements INotifier {
 async function main() {
   const node = new SimulatedNode(HAPPY_PATH_CHAIN);
   const notifier = new ConsoleNotifier();
-  const scanner = new VaultSwapScanner(node, notifier, 999);
+  // startBlock is inclusive; the fixture's first block is 1000.
+  const scanner = new VaultSwapScanner(node, notifier, 1000);
 
   await scanner.start();
   console.log('\nScanner finished.');
