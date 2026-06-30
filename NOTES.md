@@ -46,19 +46,28 @@ same store instance.
 re-processes that block on restart instead of skipping the rest of its logs;
 re-processing is safe because notifications are deduped by the notified set.
 
-**Delivery is at-least-once.** `notify()` runs first, then `markNotified()`. A
-crash in between re-emits one notification on restart. Losing a settlement
-notification is worse than a rare duplicate. Exactly-once comes from an
-idempotent notifier keyed on `swapId`, or a transactional outbox so the
-notification record and the checkpoint commit in one transaction.
+**Delivery is off the critical path, via a transactional outbox.** Finalising an
+operation does *not* call the notifier; it enqueues the notification to the
+outbox (a local, reliable write) alongside `markNotified` + the pending cleanup,
+and the checkpoint then advances. A separate `drainOutbox()` delivers queued
+entries, retrying per call and moving an entry to a **dead-letter queue** after
+`maxDeliveryAttempts` failures. So a slow or permanently-failing ("poison")
+notification can never stall block processing or the head — and one undeliverable
+entry can't block the rest of the queue either. `start()` drains once at the end
+as a convenience (non-fatal); `autoDrain: false` runs delivery as a fully separate
+loop, which is the production shape (scanner and delivery worker scale apart).
 
-> Known liveness gap (Part 1). `notify()` runs synchronously on the critical
-> path and `withRetry` re-throws on exhaustion, so a permanently failing
-> ("poison") notification aborts the whole catch-up and stalls head progress for
-> every swap behind it. The outbox fixes this too: commit only the notification
-> record on the critical path (a local, reliable write) and drain it from a
-> separate worker with its own retry and a dead-letter queue, so one
-> undeliverable notification never blocks block processing.
+Delivery is **at-least-once**: a crash between enqueue and `markNotified` re-emits
+one notification on restart (the notified-set seals against re-enqueue thereafter),
+and the consumer dedupes on `swapId` / `loanId` for exactly-once *effect*. In
+production the outbox row commits in the same transaction as the checkpoint and
+notified/pending updates, so "the checkpoint advanced" and "a delivery is durably
+queued" become one atomic fact.
+
+> Historical note. Earlier parts delivered synchronously on the critical path, so
+> a poison notification aborted the catch-up and stalled every operation behind
+> it. The outbox above resolves that; this paragraph is kept to record the
+> evolution.
 
 **Incomplete swaps are dropped with a warning, not emitted.** A `SwapSettled`
 with no stored `SwapRequested` + `FundsLocked` can't produce a complete
@@ -258,10 +267,11 @@ The rest is about removing or amortising round-trips, in rough order of impact.
    round-trips per window instead of two-plus per event. The in-memory store
    already behaves this way.
 
-5. **Take the notifier off the critical path.** Write notifications to a durable
-   outbox in the same transaction as the state commit and drain them from a
-   separate worker. Per-block latency then depends on a local DB write, not an
-   external service, and delivery becomes exactly-once.
+5. **Take the notifier off the critical path** (implemented). Notifications are
+   written to a durable outbox and drained by a separate pass, so per-block
+   latency depends on a local write, not an external service. In production the
+   outbox row commits in the same transaction as the state for exactly-once
+   effect; here it is an in-memory queue with a dead-letter tail.
 
 6. **Subscribe instead of poll.** Interval-polling `getLatestBlockNumber` adds
    overhead and discovery latency. A push subscription (`newHeads` / log

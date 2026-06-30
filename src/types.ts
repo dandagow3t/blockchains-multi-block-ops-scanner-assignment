@@ -120,6 +120,55 @@ export interface SwapNotification {
   reason?: string;
 }
 
+// ── Part 4: Loan operation (a 2-step operation) ──────────────────────────────
+
+export interface LoanRequestedEvent {
+  type: 'LoanRequested';
+  loanId: string;
+  borrower: string;
+  amount: string;
+  /** Block by which the loan must be repaid. Repayment must land BEFORE this. */
+  dueBlock: number;
+  blockNumber: number;
+  txHash: string;
+}
+
+export interface LoanRepaidEvent {
+  type: 'LoanRepaid';
+  loanId: string;
+  borrower: string;
+  amountRepaid: string;
+  blockNumber: number;
+  txHash: string;
+}
+
+export type LoanEvent = LoanRequestedEvent | LoanRepaidEvent;
+
+/** Every protocol log the scanner understands, across both operation types. */
+export type ProtocolEvent = SwapEvent | LoanEvent;
+
+export type LoanOutcome = 'repaid' | 'defaulted';
+
+/**
+ * Emitted once when a loan reaches a final state.
+ *
+ *   - repaid    → a LoanRepaid was observed in a block BEFORE dueBlock; `repaid`
+ *                 is set.
+ *   - defaulted → the chain reached dueBlock with no repayment. There is no
+ *                 terminating event — a default is the *absence* of one — so
+ *                 `repaid` is unset. The deadline that was missed is
+ *                 `requested.dueBlock`.
+ *
+ * `requested` is always present: it is the correlation anchor and carries the
+ * deadline, so a loan with no observed request is never notified.
+ */
+export interface LoanNotification {
+  loanId: string;
+  outcome: LoanOutcome;
+  requested: LoanRequestedEvent;
+  repaid?: LoanRepaidEvent;
+}
+
 // ── Node interface ────────────────────────────────────────────────────────────
 
 export interface IBlockchainNode {
@@ -131,4 +180,5 @@ export interface IBlockchainNode {
 
 export interface INotifier {
   notify(notification: SwapNotification): Promise<void>;
+  notifyLoan(notification: LoanNotification): Promise<void>;
 }

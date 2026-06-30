@@ -1,4 +1,10 @@
-import { FundsLockedEvent, SwapRequestedEvent } from './types';
+import {
+  FundsLockedEvent,
+  LoanNotification,
+  LoanRequestedEvent,
+  SwapNotification,
+  SwapRequestedEvent,
+} from './types';
 
 /**
  * In-flight state for a swap that has not yet settled.
@@ -10,6 +16,22 @@ import { FundsLockedEvent, SwapRequestedEvent } from './types';
 export interface SwapState {
   requested?: SwapRequestedEvent;
   fundsLocked?: FundsLockedEvent;
+}
+
+/**
+ * A finalised notification awaiting delivery — the transactional-outbox record.
+ *
+ * Finalising an operation enqueues one of these (a local, reliable write) instead
+ * of calling the notifier on the critical path; a separate drain delivers them.
+ * `key` is `${kind}:${id}`, the idempotency key, so re-enqueueing the same
+ * operation is a no-op rather than a duplicate.
+ */
+export interface OutboxEntry {
+  key: string;
+  kind: 'swap' | 'loan';
+  notification: SwapNotification | LoanNotification;
+  /** Failed delivery attempts so far; drives the dead-letter threshold. */
+  attempts: number;
 }
 
 /**
@@ -64,6 +86,7 @@ export interface IScannerStore {
    */
   hasNotificationAfter(blockNumber: number): Promise<boolean>;
 
+  // ── Swaps ──
   getPending(swapId: string): Promise<SwapState | undefined>;
   putPending(swapId: string, state: SwapState): Promise<void>;
   deletePending(swapId: string): Promise<void>;
@@ -71,6 +94,36 @@ export interface IScannerStore {
   isNotified(swapId: string): Promise<boolean>;
   /** Records the swap as notified, tagged with the block it was finalised at. */
   markNotified(swapId: string, blockNumber: number): Promise<void>;
+
+  // ── Loans (Part 4) ──
+  // A loan's only pending state is its request, which carries the deadline; once
+  // repaid or defaulted it is removed and recorded in the notified set.
+  getPendingLoan(loanId: string): Promise<LoanRequestedEvent | undefined>;
+  putPendingLoan(loan: LoanRequestedEvent): Promise<void>;
+  deletePendingLoan(loanId: string): Promise<void>;
+
+  /**
+   * Outstanding loans whose dueBlock has been reached (dueBlock <= blockNumber).
+   * These are the loans that default at `blockNumber` unless already repaid
+   * (repaid loans are removed from pending, so they never appear here).
+   */
+  loansDueBy(blockNumber: number): Promise<LoanRequestedEvent[]>;
+
+  isLoanNotified(loanId: string): Promise<boolean>;
+  /** Records the loan as notified, tagged with the block it was finalised at. */
+  markLoanNotified(loanId: string, blockNumber: number): Promise<void>;
+
+  // ── Outbox (delivery off the critical path) ──
+  // In production these rows commit in the SAME transaction as the checkpoint and
+  // the notified/pending updates, so "the checkpoint advanced" and "a delivery is
+  // durably queued" are the same atomic fact. A separate worker drains them.
+  enqueueOutbox(entry: OutboxEntry): Promise<void>;
+  /** Undelivered entries in FIFO order. */
+  peekOutbox(): Promise<OutboxEntry[]>;
+  recordOutboxAttempt(key: string): Promise<void>;
+  markDelivered(key: string): Promise<void>;
+  moveToDeadLetter(key: string): Promise<void>;
+  getDeadLetters(): Promise<OutboxEntry[]>;
 }
 
 /**
@@ -132,10 +185,15 @@ export class InMemoryScannerStore implements IScannerStore {
       if (state.fundsLocked && state.fundsLocked.blockNumber > ancestor) state.fundsLocked = undefined;
       if (!state.requested && !state.fundsLocked) this.pending.delete(swapId);
     }
+    // Loans recorded from orphaned blocks are dropped the same way (Part 4).
+    for (const [loanId, loan] of this.pendingLoans) {
+      if (loan.blockNumber > ancestor) this.pendingLoans.delete(loanId);
+    }
   }
 
   async hasNotificationAfter(blockNumber: number): Promise<boolean> {
     for (const b of this.notified.values()) if (b > blockNumber) return true;
+    for (const b of this.notifiedLoans.values()) if (b > blockNumber) return true;
     return false;
   }
 
@@ -159,5 +217,80 @@ export class InMemoryScannerStore implements IScannerStore {
 
   async markNotified(swapId: string, blockNumber: number): Promise<void> {
     this.notified.set(swapId, blockNumber);
+  }
+
+  // ── Loans (Part 4) ──
+
+  private readonly pendingLoans = new Map<string, LoanRequestedEvent>();
+  /** loanId -> block it was finalised at (drives the recovery un-notify guard). */
+  private readonly notifiedLoans = new Map<string, number>();
+
+  async getPendingLoan(loanId: string): Promise<LoanRequestedEvent | undefined> {
+    return this.pendingLoans.get(loanId);
+  }
+
+  async putPendingLoan(loan: LoanRequestedEvent): Promise<void> {
+    this.pendingLoans.set(loan.loanId, loan);
+  }
+
+  async deletePendingLoan(loanId: string): Promise<void> {
+    this.pendingLoans.delete(loanId);
+  }
+
+  async loansDueBy(blockNumber: number): Promise<LoanRequestedEvent[]> {
+    // Linear scan of outstanding loans. Fine for an in-memory store; in
+    // production this is a single indexed query (`WHERE due_block <= $1 AND
+    // status = 'pending'`) or a min-heap keyed on dueBlock, so the per-block cost
+    // is the number of loans that actually come due, not all outstanding ones.
+    const due: LoanRequestedEvent[] = [];
+    for (const loan of this.pendingLoans.values()) {
+      if (loan.dueBlock <= blockNumber) due.push(loan);
+    }
+    return due;
+  }
+
+  async isLoanNotified(loanId: string): Promise<boolean> {
+    return this.notifiedLoans.has(loanId);
+  }
+
+  async markLoanNotified(loanId: string, blockNumber: number): Promise<void> {
+    this.notifiedLoans.set(loanId, blockNumber);
+  }
+
+  // ── Outbox (Part 4 follow-up: delivery off the critical path) ──
+
+  private readonly outbox = new Map<string, OutboxEntry>();
+  private readonly deadLetters: OutboxEntry[] = [];
+
+  async enqueueOutbox(entry: OutboxEntry): Promise<void> {
+    // Idempotent by key: re-finalising the same operation overwrites rather than
+    // duplicating. Map preserves the original insertion position, so FIFO order
+    // is stable across an overwrite.
+    this.outbox.set(entry.key, { ...entry });
+  }
+
+  async peekOutbox(): Promise<OutboxEntry[]> {
+    return Array.from(this.outbox.values()).map((e) => ({ ...e }));
+  }
+
+  async recordOutboxAttempt(key: string): Promise<void> {
+    const entry = this.outbox.get(key);
+    if (entry) entry.attempts += 1;
+  }
+
+  async markDelivered(key: string): Promise<void> {
+    this.outbox.delete(key);
+  }
+
+  async moveToDeadLetter(key: string): Promise<void> {
+    const entry = this.outbox.get(key);
+    if (entry) {
+      this.outbox.delete(key);
+      this.deadLetters.push(entry);
+    }
+  }
+
+  async getDeadLetters(): Promise<OutboxEntry[]> {
+    return this.deadLetters.map((e) => ({ ...e }));
   }
 }

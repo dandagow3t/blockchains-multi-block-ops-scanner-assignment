@@ -1,6 +1,6 @@
 import { SimulatedNode } from './node';
 import { VaultSwapScanner } from './scanner';
-import { SwapNotification, INotifier } from './types';
+import { SwapNotification, LoanNotification, INotifier } from './types';
 import { HAPPY_PATH_CHAIN } from './fixtures/chain';
 
 class ConsoleNotifier implements INotifier {
@@ -10,6 +10,12 @@ class ConsoleNotifier implements INotifier {
     if (n.fundsLocked) console.log(`  Locked    : block ${n.fundsLocked.blockNumber}`);
     if (n.settled) console.log(`  Settled   : block ${n.settled.blockNumber}, out=${n.settled.amountOut}`);
     if (n.reason) console.log(`  Reason    : ${n.reason}`);
+  }
+
+  async notifyLoan(n: LoanNotification): Promise<void> {
+    console.log(`\n[NOTIFICATION] Loan ${n.loanId} — ${n.outcome.toUpperCase()}`);
+    console.log(`  Requested : block ${n.requested.blockNumber}, ${n.requested.amount}, due ${n.requested.dueBlock}`);
+    if (n.repaid) console.log(`  Repaid    : block ${n.repaid.blockNumber}, ${n.repaid.amountRepaid}`);
   }
 }
 

@@ -12,6 +12,7 @@ import {
   FundsLockFailedEvent,
   IBlockchainNode,
   INotifier,
+  LoanNotification,
   RawLog,
   SwapCancelledEvent,
   SwapNotification,
@@ -53,25 +54,52 @@ class RecordingLogger implements ILogger {
 
 class CapturingNotifier implements INotifier {
   public notifications: SwapNotification[] = [];
+  public loanNotifications: LoanNotification[] = [];
   async notify(n: SwapNotification): Promise<void> {
     this.notifications.push(n);
+  }
+  async notifyLoan(n: LoanNotification): Promise<void> {
+    this.loanNotifications.push(n);
   }
 }
 
 /**
  * Notifier that fails its first `failuresLeft` calls, then succeeds. Used to
  * model a flaky downstream sink. The same instance carried across two scanner
- * runs simulates "failed during this run, recovered on restart".
+ * runs simulates "failed during this run, recovered on restart". The failure
+ * budget is shared across swap and loan deliveries.
  */
 class FlakyNotifier implements INotifier {
   public notifications: SwapNotification[] = [];
+  public loanNotifications: LoanNotification[] = [];
   constructor(private failuresLeft: number) {}
   async notify(n: SwapNotification): Promise<void> {
+    this.maybeFail();
+    this.notifications.push(n);
+  }
+  async notifyLoan(n: LoanNotification): Promise<void> {
+    this.maybeFail();
+    this.loanNotifications.push(n);
+  }
+  private maybeFail(): void {
     if (this.failuresLeft > 0) {
       this.failuresLeft--;
       throw new Error('notify failed (downstream unavailable)');
     }
+  }
+}
+
+/** Always fails delivery for the given swapIds; delivers everything else. */
+class PoisonNotifier implements INotifier {
+  public notifications: SwapNotification[] = [];
+  public loanNotifications: LoanNotification[] = [];
+  constructor(private readonly poisonSwapIds: Set<string>) {}
+  async notify(n: SwapNotification): Promise<void> {
+    if (this.poisonSwapIds.has(n.swapId)) throw new Error(`poison: ${n.swapId}`);
     this.notifications.push(n);
+  }
+  async notifyLoan(n: LoanNotification): Promise<void> {
+    this.loanNotifications.push(n);
   }
 }
 
@@ -203,6 +231,29 @@ function cancelledLog(
     address: CONTRACT,
     event: 'SwapCancelled',
     args: { txHash: nextTx(), swapId, by, reason, ...over },
+  };
+}
+
+function loanRequestedLog(
+  loanId: string,
+  dueBlock: number,
+  over: Record<string, string | number> = {},
+): RawLog {
+  return {
+    address: CONTRACT,
+    event: 'LoanRequested',
+    args: { txHash: nextTx(), loanId, borrower: '0xBob', amount: '5000000', dueBlock, ...over },
+  };
+}
+
+function loanRepaidLog(
+  loanId: string,
+  over: Record<string, string | number> = {},
+): RawLog {
+  return {
+    address: CONTRACT,
+    event: 'LoanRepaid',
+    args: { txHash: nextTx(), loanId, borrower: '0xBob', amountRepaid: '5000000', ...over },
   };
 }
 
@@ -634,6 +685,37 @@ describe('chain reorganisation', () => {
     expect(await store.getCheckpoint()).toBe(3); // not advanced, not rewound
   });
 
+  test('recovery drops an orphaned loan request so it never spuriously defaults', async () => {
+    const store = new InMemoryScannerStore();
+    const logger = new RecordingLogger();
+
+    // Run 1: a loan is requested at block 2 (due at block 5) — pending, not yet
+    // notified. Checkpoint reaches 2.
+    const run1 = new SimulatedNode([block(1), block(2, [loanRequestedLog('loan-orph', 5)])]);
+    await makeScanner(run1, new CapturingNotifier(), { store }).start();
+    expect(await store.getCheckpoint()).toBe(2);
+
+    // Run 2: block 2 is orphaned ('0xblock2-B') WITHOUT the loan request; the
+    // canonical chain extends empty past the old due block. Recovery rewinds to
+    // block 1 and drops the orphaned pending loan, so no 'defaulted' is ever
+    // emitted for a loan that does not exist on the canonical chain.
+    const notifier = new CapturingNotifier();
+    const run2 = new SimulatedNode([
+      block(1),
+      { number: 2, hash: '0xblock2-B', parentHash: '0xblock1', logs: [] },
+      { number: 3, hash: '0xblock3', parentHash: '0xblock2-B', logs: [] },
+      block(4, [], '0xblock4'),
+      block(5, [], '0xblock5'),
+      block(6, [], '0xblock6'),
+    ]);
+
+    await makeScanner(run2, notifier, { store, logger }).start();
+
+    expect(notifier.loanNotifications).toHaveLength(0); // orphaned loan never defaults
+    expect(logger.warns.some((m) => m.includes('Reorg recovered'))).toBe(true);
+    expect(await store.getCheckpoint()).toBe(6);
+  });
+
   test('does NOT roll back a settle already processed before the reorg (Level-1 limitation)', async () => {
     const store = new InMemoryScannerStore();
 
@@ -712,32 +794,8 @@ describe('node reliability', () => {
     expect(recovered.notifications[0].swapId).toBe('swap-1');
   });
 
-  test('at-least-once: a notification that fails on the critical path is re-emitted on restart, not lost', async () => {
-    const store = new InMemoryScannerStore();
-    // maxRetries 2 => 3 attempts per settle; fail all 3 so the run aborts.
-    const notifier = new FlakyNotifier(3);
-    const node = new SimulatedNode(happyPath('swap-1', 1));
-
-    const failing = makeScanner(node, notifier, { store, retry: { ...FAST_RETRY, maxRetries: 2 } });
-    await expect(failing.start()).rejects.toThrow(/notify failed/);
-    expect(notifier.notifications).toHaveLength(0);
-    // Settle block was not checkpointed, and the swap was not marked notified.
-    expect(await store.getCheckpoint()).toBe(2);
-
-    // Restart with the same (now-recovered) notifier: the swap settles exactly once.
-    await makeScanner(node, notifier, { store }).start();
-    expect(notifier.notifications).toHaveLength(1);
-    expect(notifier.notifications[0].swapId).toBe('swap-1');
-  });
-
-  test('retries a transient notification failure within a single run', async () => {
-    const notifier = new FlakyNotifier(2); // fails twice, then delivers
-    const node = new SimulatedNode(happyPath('swap-1', 1));
-
-    await makeScanner(node, notifier, { retry: { ...FAST_RETRY, maxRetries: 3 } }).start();
-
-    expect(notifier.notifications).toHaveLength(1);
-  });
+  // Notification-delivery reliability lives in its own suite below; the node's
+  // reliability (getBlock / getLatestBlockNumber) is what this group covers.
 });
 
 describe('idle behaviour', () => {
@@ -1008,5 +1066,256 @@ describe('intra-block log ordering', () => {
     const n = notifier.notifications[0];
     expect(n.outcome).toBe('cancelled');
     expect(n.fundsLocked).toMatchObject({ blockNumber: 2 });
+  });
+});
+
+describe('loan operations (Part 4)', () => {
+  test('emits a repaid notification when a loan is repaid before its dueBlock', async () => {
+    const notifier = new CapturingNotifier();
+    const node = new SimulatedNode([
+      block(1, [loanRequestedLog('loan-1', 5)]),
+      block(2, []),
+      block(3, [loanRepaidLog('loan-1')]),
+    ]);
+
+    await makeScanner(node, notifier).start();
+
+    expect(notifier.notifications).toHaveLength(0); // no swap notifications
+    expect(notifier.loanNotifications).toHaveLength(1);
+    expect(notifier.loanNotifications[0]).toMatchObject({
+      loanId: 'loan-1',
+      outcome: 'repaid',
+      requested: { type: 'LoanRequested', dueBlock: 5, blockNumber: 1 },
+      repaid: { type: 'LoanRepaid', blockNumber: 3, amountRepaid: '5000000' },
+    });
+  });
+
+  test('emits a defaulted notification when dueBlock is reached with no repayment', async () => {
+    const notifier = new CapturingNotifier();
+    const node = new SimulatedNode([
+      block(1, [loanRequestedLog('loan-d', 4)]),
+      block(2, []),
+      block(3, []),
+      block(4, []), // dueBlock reached, still unpaid
+    ]);
+
+    await makeScanner(node, notifier).start();
+
+    expect(notifier.loanNotifications).toHaveLength(1);
+    const n = notifier.loanNotifications[0];
+    expect(n.outcome).toBe('defaulted');
+    expect(n.repaid).toBeUndefined(); // a default has no terminating event
+    expect(n.requested.dueBlock).toBe(4);
+  });
+
+  test('a repayment landing AT dueBlock is too late, and the loan defaults', async () => {
+    const notifier = new CapturingNotifier();
+    const node = new SimulatedNode([
+      block(1, [loanRequestedLog('loan-late', 3)]),
+      block(2, []),
+      block(3, [loanRepaidLog('loan-late')]), // repaid exactly at dueBlock — not "before"
+    ]);
+
+    await makeScanner(node, notifier).start();
+
+    expect(notifier.loanNotifications).toHaveLength(1);
+    expect(notifier.loanNotifications[0].outcome).toBe('defaulted');
+  });
+
+  test('a default does not fire until its dueBlock is confirmation-deep', async () => {
+    const store = new InMemoryScannerStore();
+    const node = new UnreliableNode(
+      new SimulatedNode([block(1, [loanRequestedLog('loan-c', 3)]), block(2, []), block(3, [])]),
+    );
+
+    // tip = 3, confirmations = 2 => safeTip = 1: dueBlock 3 is not yet final.
+    node.withLatest(3);
+    const first = new CapturingNotifier();
+    await makeScanner(node, first, { store, confirmations: 2 }).start();
+    expect(first.loanNotifications).toHaveLength(0);
+
+    // Chain advances; safeTip reaches 3, so the default is now safe to emit.
+    node.withLatest(5);
+    const second = new CapturingNotifier();
+    await makeScanner(node, second, { store, confirmations: 2 }).start();
+    expect(second.loanNotifications.map((n) => n.outcome)).toEqual(['defaulted']);
+  });
+
+  test('a pending loan survives a restart and defaults when its dueBlock later arrives', async () => {
+    const store = new InMemoryScannerStore();
+    const node = new UnreliableNode(
+      new SimulatedNode([block(1, [loanRequestedLog('loan-r', 3)]), block(2, []), block(3, [])]),
+    );
+
+    // First run only reaches block 2: the loan is recorded but not yet due.
+    node.withLatest(2);
+    const first = new CapturingNotifier();
+    await makeScanner(node, first, { store }).start();
+    expect(first.loanNotifications).toHaveLength(0);
+
+    // Restart over the same store; the chain now reaches the dueBlock.
+    node.withLatest(3);
+    const second = new CapturingNotifier();
+    await makeScanner(node, second, { store }).start();
+    expect(second.loanNotifications.map((n) => n.outcome)).toEqual(['defaulted']);
+  });
+
+  test('a default is emitted once and not re-emitted as the chain grows', async () => {
+    const store = new InMemoryScannerStore();
+    const node = new UnreliableNode(
+      new SimulatedNode([block(1, [loanRequestedLog('loan-1x', 2)]), block(2, []), block(3, [])]),
+    );
+
+    node.withLatest(2);
+    const first = new CapturingNotifier();
+    await makeScanner(node, first, { store }).start();
+    expect(first.loanNotifications).toHaveLength(1); // defaulted at block 2
+
+    node.withLatest(3);
+    const second = new CapturingNotifier();
+    await makeScanner(node, second, { store }).start();
+    expect(second.loanNotifications).toHaveLength(0); // not re-emitted
+  });
+
+  test('drops a LoanRepaid with no observed LoanRequested (started mid-loan)', async () => {
+    const notifier = new CapturingNotifier();
+    const node = new SimulatedNode([block(1, [loanRepaidLog('loan-orphan')])]);
+
+    await makeScanner(node, notifier).start();
+
+    expect(notifier.loanNotifications).toHaveLength(0);
+  });
+
+  test('correlates two loans independently — one repaid, one defaulted', async () => {
+    const notifier = new CapturingNotifier();
+    const node = new SimulatedNode([
+      block(1, [loanRequestedLog('loan-A', 5), loanRequestedLog('loan-B', 3)]),
+      block(2, [loanRepaidLog('loan-A')]), // A repaid before its due block 5
+      block(3, []), // B's due block 3 reached, unpaid
+    ]);
+
+    await makeScanner(node, notifier).start();
+
+    const byId = Object.fromEntries(notifier.loanNotifications.map((n) => [n.loanId, n.outcome]));
+    expect(byId).toEqual({ 'loan-A': 'repaid', 'loan-B': 'defaulted' });
+  });
+
+  test('correlates a LoanRepaid that precedes its LoanRequested in the same block', async () => {
+    const notifier = new CapturingNotifier();
+    const node = new SimulatedNode([
+      block(1, [loanRepaidLog('loan-ord'), loanRequestedLog('loan-ord', 5)]),
+    ]);
+
+    await makeScanner(node, notifier).start();
+
+    expect(notifier.loanNotifications).toHaveLength(1);
+    expect(notifier.loanNotifications[0].outcome).toBe('repaid');
+  });
+
+  test('a conflicting re-request keeps the original dueBlock (first request wins)', async () => {
+    const notifier = new CapturingNotifier();
+    const logger = new RecordingLogger();
+    const node = new SimulatedNode([
+      block(1, [loanRequestedLog('loan-conf', 3)]), // original deadline: block 3
+      block(2, [loanRequestedLog('loan-conf', 10)]), // conflicting re-request: block 10
+      block(3, []),
+      block(4, []),
+    ]);
+
+    await makeScanner(node, notifier, { logger }).start();
+
+    // The default must fire at the ORIGINAL dueBlock 3, not the moved-out 10.
+    expect(notifier.loanNotifications).toHaveLength(1);
+    expect(notifier.loanNotifications[0].outcome).toBe('defaulted');
+    expect(notifier.loanNotifications[0].requested.dueBlock).toBe(3);
+    expect(logger.warns.some((m) => m.includes('loan-conf') && m.includes('conflicts'))).toBe(true);
+  });
+});
+
+describe('outbox delivery (off the critical path)', () => {
+  test('a notifier outage does not block scanning: the work is checkpointed and queued', async () => {
+    const store = new InMemoryScannerStore();
+    const node = new SimulatedNode(happyPath('swap-1', 1));
+    // Sink is down: every delivery attempt throws.
+    const down = new FlakyNotifier(Number.MAX_SAFE_INTEGER);
+
+    // autoDrain:false → start() only scans + enqueues; it must not throw.
+    const scanner = makeScanner(node, down, { store, autoDrain: false });
+    await scanner.start();
+
+    // Scanning finished and the checkpoint advanced despite the sink being down.
+    expect(await store.getCheckpoint()).toBe(3);
+    expect(down.notifications).toHaveLength(0);
+    // The notification is durably queued in the outbox.
+    expect((await store.peekOutbox()).map((e) => e.key)).toEqual(['swap:swap-1']);
+
+    // Sink recovers; a drain (here a fresh scanner over the same store, i.e. a
+    // separate delivery worker) delivers it and clears the outbox.
+    const up = new CapturingNotifier();
+    await makeScanner(node, up, { store }).drainOutbox();
+    expect(up.notifications.map((n) => n.swapId)).toEqual(['swap-1']);
+    expect(await store.peekOutbox()).toHaveLength(0);
+  });
+
+  test('a transient delivery failure is retried on a later drain, not lost', async () => {
+    const store = new InMemoryScannerStore();
+    const node = new SimulatedNode(happyPath('swap-1', 1));
+    const notifier = new FlakyNotifier(1); // first delivery fails, then succeeds
+    const scanner = makeScanner(node, notifier, { store, autoDrain: false });
+
+    await scanner.start();
+    await scanner.drainOutbox(); // attempt 1 fails
+    expect(notifier.notifications).toHaveLength(0);
+    expect(await store.peekOutbox()).toHaveLength(1); // still queued
+
+    await scanner.drainOutbox(); // attempt 2 succeeds
+    expect(notifier.notifications).toHaveLength(1);
+    expect(await store.peekOutbox()).toHaveLength(0);
+  });
+
+  test('a permanently undeliverable notification is dead-lettered and does not block others', async () => {
+    const store = new InMemoryScannerStore();
+    const node = new SimulatedNode([...happyPath('swap-good', 1), ...happyPath('swap-poison', 4)]);
+    const notifier = new PoisonNotifier(new Set(['swap-poison']));
+
+    const scanner = makeScanner(node, notifier, {
+      store,
+      autoDrain: false,
+      maxDeliveryAttempts: 3,
+    });
+    await scanner.start();
+
+    // Drain three times: the good one delivers immediately; the poison one fails
+    // each pass and is dead-lettered on the third.
+    await scanner.drainOutbox();
+    await scanner.drainOutbox();
+    await scanner.drainOutbox();
+
+    expect(notifier.notifications.map((n) => n.swapId)).toEqual(['swap-good']); // delivered once
+    expect(await store.peekOutbox()).toHaveLength(0); // nothing left blocking the queue
+    expect((await store.getDeadLetters()).map((e) => e.key)).toEqual(['swap:swap-poison']);
+  });
+
+  test('auto-drain (default) delivers without an explicit drain call', async () => {
+    const node = new SimulatedNode(happyPath('swap-1', 1));
+    const notifier = new CapturingNotifier();
+
+    await makeScanner(node, notifier).start(); // autoDrain defaults to true
+
+    expect(notifier.notifications.map((n) => n.swapId)).toEqual(['swap-1']);
+  });
+
+  test('loan notifications flow through the same outbox', async () => {
+    const store = new InMemoryScannerStore();
+    const node = new SimulatedNode([block(1, [loanRequestedLog('loan-1', 5)]), block(2, [loanRepaidLog('loan-1')]), block(3, [])]);
+    const down = new FlakyNotifier(Number.MAX_SAFE_INTEGER);
+
+    await makeScanner(node, down, { store, autoDrain: false }).start();
+    expect((await store.peekOutbox()).map((e) => e.key)).toEqual(['loan:loan-1']);
+
+    const up = new CapturingNotifier();
+    await makeScanner(node, up, { store }).drainOutbox();
+    expect(up.loanNotifications.map((n) => n.outcome)).toEqual(['repaid']);
+    expect(await store.peekOutbox()).toHaveLength(0);
   });
 });

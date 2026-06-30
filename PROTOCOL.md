@@ -172,9 +172,10 @@ being silently dropped at runtime.
 - The per-block dispatch routes all three terminal events to a single
   `handleTerminal`, replacing the settle-only `handleSettled`.
 - `handleTerminal` keeps the Part 1 guarantees unchanged: dedupe via the
-  `notified` set, at-least-once delivery (notify → mark → clean up), and retry on
-  notifier failure. A new `correlate()` helper builds the right notification per
-  outcome, or returns `null` (drop + warn) when it can't be anchored.
+  `notified` set and at-least-once delivery (the delivery mechanism was later
+  moved off the critical path into an outbox — see Part 4). A new `correlate()`
+  helper builds the right notification per outcome, or returns `null` (drop +
+  warn) when it can't be anchored.
 - A block is now processed in two passes — record all partials, then handle all
   terminals — so correlation no longer depends on the order of logs *within* a
   block. Previously a terminal positioned before its own prerequisite in the same
@@ -200,3 +201,111 @@ for an early-termination outcome.
 - **Contradictory on-chain terminals** (e.g. `FundsLockFailed` after a successful
   `FundsLocked`) — treated as the first-terminal-wins case; the scanner does not
   attempt to police protocol-level invariants the contract should enforce.
+
+---
+
+# Part 4 — Second operation type: loan repayments
+
+Loans are a 2-step operation — `LoanRequested(loanId, borrower, amount, dueBlock)`
+then `LoanRepaid(loanId, borrower, amountRepaid)` — emitting a `LoanNotification`
+with outcome `repaid` or `defaulted`.
+
+## The key difference from swaps: a terminal with no event
+
+Every swap outcome corresponds to an on-chain *event* the scanner can react to. A
+loan **default** does not: it is the *absence* of a `LoanRepaid` by the deadline.
+Nothing is emitted on-chain when a loan defaults — the deadline simply passes. So
+the scanner has to **synthesize** that terminal from block height rather than
+parse it from a log.
+
+That drives the core design decision:
+
+> The scanner sweeps for defaults once per processed block. After applying block
+> `N`'s events, it asks the store for outstanding loans with `dueBlock <= N` and
+> emits a `defaulted` notification for each. Running the sweep on *every* block —
+> including logless ones — is what lets a default fire exactly when its deadline
+> is reached.
+
+Because the sweep only runs for blocks up to `safeTip` (`latest - confirmations`),
+a default inherits the same finality guarantee as every other notification: it is
+not emitted until its `dueBlock` is confirmation-deep, so a reorg shallower than
+`confirmations` cannot retract it. The loan tests assert this directly.
+
+## Repaid vs defaulted boundary
+
+The spec says *repaid if `LoanRepaid` is seen **before** `dueBlock`* and
+*defaulted if `dueBlock` is reached with no repayment*. Taken literally, the
+deadline is exclusive:
+
+- `LoanRepaid` in a block **`< dueBlock`** → `repaid`.
+- A repayment in or after `dueBlock` is **too late**; the loan defaults. The
+  repayment handler detects this and leaves the loan for the default sweep (which
+  fires in the same block), rather than emitting `repaid`.
+
+This is the strict reading. If the protocol actually intends "repay by the end of
+`dueBlock`" (inclusive), it is a one-character change (`>=` → `>`) in
+`handleLoanRepaid`; the boundary is called out here precisely because it is a
+judgement call a reviewer should be able to flip deliberately.
+
+## Restart-safety and idempotency
+
+Loans reuse the Part 1 machinery, in a parallel namespace so a `loanId` can never
+collide with a `swapId`:
+
+- **Pending loans persist** (the `LoanRequested`, which carries the deadline), so a
+  loan requested before a restart still defaults on time after it — verified by
+  test. This is *why* the deadline can't be tracked in memory alone.
+- **A notified-loan set** dedupes, so re-processing a block after a crash or replay
+  never emits a second `repaid`/`defaulted`.
+- **At-least-once delivery** (`notify → mark → clean up`) and **two-pass intra-block
+  ordering** carry over unchanged, so a `LoanRepaid` sharing a block with its own
+  `LoanRequested` still correlates.
+
+## Notification shape
+
+```ts
+interface LoanNotification {
+  loanId: string;
+  outcome: 'repaid' | 'defaulted';
+  requested: LoanRequestedEvent;   // anchor + carries dueBlock; always present
+  repaid?: LoanRepaidEvent;        // set for repaid; absent for defaulted
+}
+```
+
+A `defaulted` notification has no `repaid` event by construction — there is no
+terminating transaction. The missed deadline is read from `requested.dueBlock`.
+
+## Implementation notes
+
+- `INotifier` gains `notifyLoan(LoanNotification)` alongside `notify`. The two
+  operation types deliver through one sink here; in production they would likely
+  be separate topics/partitions (keyed by `loanId` / `swapId`).
+- `IScannerStore` gains a parallel set of loan methods, including
+  `loansDueBy(blockNumber)`. The in-memory implementation scans outstanding loans
+  linearly; production indexes on `dueBlock` (a `WHERE due_block <= $1` query or a
+  min-heap) so the per-block cost is the number of loans actually coming due.
+- `parseLog` rejects a `LoanRequested` whose `dueBlock` is non-integer — a bad
+  deadline would mis-time every default for that loan, so it is dropped with a
+  warning rather than trusted.
+- **First request wins.** A re-request for a still-pending loan that carries a
+  *different* `dueBlock` is a protocol anomaly (the deadline would silently move),
+  so `recordLoan` keeps the original and warns instead of overwriting — the loan
+  analogue of the swap path's first-terminal-wins sealing.
+- **Delivery is off the critical path (transactional outbox).** Both operation
+  types finalise the same way: enqueue the notification to the outbox + mark +
+  clean up (all local writes), then the checkpoint advances. A separate
+  `drainOutbox()` delivers, retrying per call and dead-lettering after
+  `maxDeliveryAttempts`. So an undeliverable `defaulted` (or any) notification
+  never stalls the sweep, the block, the head, or the rest of the queue.
+  `start()` auto-drains once at the end for convenience; `autoDrain: false` runs
+  delivery as a fully separate loop. See the delivery section in `NOTES.md`.
+
+## Out of scope
+
+- **Partial repayments / refinancing** — `LoanRepaid` is treated as full
+  settlement; a multi-instalment model would track a running balance against
+  `amount` and only finalise when cleared.
+- **A loan whose `dueBlock` is at or before its request block** defaults
+  immediately on the sweep at its request block. That is a malformed loan
+  (non-future deadline); the scanner handles it gracefully rather than rejecting
+  it, on the assumption the contract enforces sane deadlines.

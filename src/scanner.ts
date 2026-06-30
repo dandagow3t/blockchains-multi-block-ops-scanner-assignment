@@ -13,8 +13,11 @@ import {
   FundsLockedEvent,
   IBlockchainNode,
   INotifier,
+  LoanNotification,
+  LoanRepaidEvent,
+  LoanRequestedEvent,
+  ProtocolEvent,
   RawLog,
-  SwapEvent,
   SwapNotification,
   SwapRequestedEvent,
   TerminalSwapEvent,
@@ -92,6 +95,21 @@ export interface ScannerOptions {
   retry?: RetryOptions;
 
   /**
+   * Deliver queued notifications at the end of start() (convenience for a
+   * single-process run). Default true. Set false to run delivery as a fully
+   * separate loop: start() only scans + enqueues, and the caller drives
+   * drainOutbox() on its own cadence.
+   */
+  autoDrain?: boolean;
+
+  /**
+   * Failed delivery attempts after which an outbox entry is moved to the
+   * dead-letter queue, so one undeliverable notification cannot block the rest of
+   * the queue forever. Default 5.
+   */
+  maxDeliveryAttempts?: number;
+
+  /**
    * How many blocks deep a reorg can be and still be auto-recovered. The default
    * in-memory store keeps this many recent block hashes; a reorg whose common
    * ancestor falls outside the window can't be located, so the scanner halts
@@ -104,7 +122,7 @@ export interface ScannerOptions {
 
 // ── Event parsing ─────────────────────────────────────────────────────────────
 
-function parseLog(log: RawLog, blockNumber: number, logger: ILogger): SwapEvent | null {
+function parseLog(log: RawLog, blockNumber: number, logger: ILogger): ProtocolEvent | null {
   if (log.address !== VAULT_SWAP_CONTRACT) return null;
 
   const txHash = String(log.args['txHash'] ?? '');
@@ -187,6 +205,37 @@ function parseLog(log: RawLog, blockNumber: number, logger: ILogger): SwapEvent 
         txHash,
       };
     }
+    case 'LoanRequested': {
+      const loanId = String(log.args['loanId']);
+      const dueBlock = Number(log.args['dueBlock']);
+      // dueBlock drives the default deadline; a non-numeric value would silently
+      // mis-time every default for this loan, so reject the malformed log.
+      if (!Number.isInteger(dueBlock)) {
+        logger.warn(
+          `LoanRequested for ${loanId} at block ${blockNumber} has a non-integer ` +
+            `dueBlock "${String(log.args['dueBlock'])}"; skipping this log.`,
+        );
+        return null;
+      }
+      return {
+        type: 'LoanRequested',
+        loanId,
+        borrower: String(log.args['borrower']),
+        amount: String(log.args['amount']),
+        dueBlock,
+        blockNumber,
+        txHash,
+      };
+    }
+    case 'LoanRepaid':
+      return {
+        type: 'LoanRepaid',
+        loanId: String(log.args['loanId']),
+        borrower: String(log.args['borrower']),
+        amountRepaid: String(log.args['amountRepaid']),
+        blockNumber,
+        txHash,
+      };
     default:
       return null;
   }
@@ -194,6 +243,28 @@ function parseLog(log: RawLog, blockNumber: number, logger: ILogger): SwapEvent 
 
 // ── Scanner ───────────────────────────────────────────────────────────────────
 
+/**
+ * Scans the chain, correlates multi-block operations by id, and emits a
+ * notification when one reaches a final state. It now handles two operation
+ * types: VaultSwap swaps and loan repayments.
+ *
+ * Design note — why both operation types live in one class. Per the brief
+ * ("extend the scanner"), the loan operation is added inline rather than as a
+ * separate component. The block loop, checkpoint, confirmation depth, retry and
+ * delivery are genuinely shared and operation-agnostic, so I kept a single
+ * scanner driving a single getBlock stream. At scale I would factor the
+ * operation-specific correlation out into one processor per operation type,
+ * registered behind a small interface that the generic core dispatches to:
+ *
+ *     handleEvent(event)            // correlate this operation's own logs
+ *     onBlockProcessed(blockNumber) // per-block hook — e.g. the loan default sweep
+ *
+ * Adding a third operation type would then be "register another processor" with
+ * no change to the core, and the store would split along the same seam
+ * (ISwapStore / ILoanStore). The class keeps the VaultSwapScanner name for
+ * continuity with Parts 1–3; ProtocolScanner would be the honest name once the
+ * processors are extracted. Kept inline here to match the assignment's scope.
+ */
 export class VaultSwapScanner {
   private readonly node: IBlockchainNode;
   private readonly notifier: INotifier;
@@ -202,6 +273,8 @@ export class VaultSwapScanner {
   private readonly store: IScannerStore;
   private readonly confirmations: number;
   private readonly retry: RetryOptions;
+  private readonly autoDrain: boolean;
+  private readonly maxDeliveryAttempts: number;
   private readonly log: ILogger;
 
   /**
@@ -219,6 +292,8 @@ export class VaultSwapScanner {
     this.store = options.store ?? new InMemoryScannerStore(options.maxReorgDepth);
     this.confirmations = options.confirmations ?? 0;
     this.retry = options.retry ?? DEFAULT_RETRY;
+    this.autoDrain = options.autoDrain ?? true;
+    this.maxDeliveryAttempts = options.maxDeliveryAttempts ?? 5;
     this.log = options.logger ?? consoleLogger;
   }
 
@@ -257,47 +332,54 @@ export class VaultSwapScanner {
 
     if (safeTip <= lastProcessed) {
       this.log.info('Nothing to do: already caught up to the safe tip.');
-      return;
-    }
+    } else {
+      for (let n = lastProcessed + 1; n <= safeTip; n++) {
+        const block = await withRetry(() => this.node.getBlock(n), {
+          ...this.retry,
+          onRetry: (err, attempt) =>
+            this.log.warn(`getBlock(${n}) failed (attempt ${attempt}): ${describe(err)}`),
+        });
 
-    for (let n = lastProcessed + 1; n <= safeTip; n++) {
-      const block = await withRetry(() => this.node.getBlock(n), {
-        ...this.retry,
-        onRetry: (err, attempt) =>
-          this.log.warn(`getBlock(${n}) failed (attempt ${attempt}): ${describe(err)}`),
-      });
+        // Reorg guard: block n must build on the block we processed as n-1.
+        // Confirmation depth makes shallow reorgs invisible (we only process
+        // blocks that are already `confirmations` deep); this catches the
+        // dangerous residue — a reorg deeper than that, or a node serving an
+        // inconsistent chain. The hash is null for the very first block (no
+        // fetched predecessor to compare), so the check is skipped there.
+        const expectedParent = await this.store.getLastBlockHash();
+        if (expectedParent !== null && block.parentHash !== expectedParent) {
+          // Try to recover: rewind to the common ancestor and re-scan the
+          // canonical chain. recoverOrThrow() rewinds the store and returns the
+          // ancestor, or throws ReorgDetectedError when recovery isn't safe (reorg
+          // deeper than the window, or an already-emitted notification orphaned).
+          // Resume the loop from the ancestor; n++ moves to ancestor+1.
+          const ancestor = await this.recoverOrThrow(n, block, expectedParent);
+          n = ancestor;
+          lastProcessed = ancestor;
+          continue;
+        }
 
-      // Reorg guard: block n must build on the block we processed as n-1.
-      // Confirmation depth makes shallow reorgs invisible (we only process
-      // blocks that are already `confirmations` deep); this catches the
-      // dangerous residue — a reorg deeper than that, or a node serving an
-      // inconsistent chain. The hash is null for the very first block (no
-      // fetched predecessor to compare), so the check is skipped there.
-      const expectedParent = await this.store.getLastBlockHash();
-      if (expectedParent !== null && block.parentHash !== expectedParent) {
-        // Try to recover: rewind to the common ancestor and re-scan the canonical
-        // chain. recoverOrThrow() rewinds the store and returns the ancestor, or
-        // throws ReorgDetectedError when recovery isn't safe (reorg deeper than the
-        // window, or an already-emitted notification was orphaned). Resume the loop
-        // from the ancestor; n++ moves to ancestor+1.
-        const ancestor = await this.recoverOrThrow(n, block, expectedParent);
-        n = ancestor;
-        lastProcessed = ancestor;
-        continue;
+        await this.processBlock(block);
+
+        // Advance the checkpoint only AFTER the whole block is processed, so a
+        // crash mid-block re-processes that block (safe: notifications are
+        // deduped by the notified-set) rather than skipping its tail of events.
+        // The block's hash is committed with the checkpoint so the next run's
+        // reorg guard has a consistent predecessor to compare against.
+        await this.store.setCheckpoint(n, block.hash);
+        lastProcessed = n;
       }
 
-      await this.processBlock(block);
-
-      // Advance the checkpoint only AFTER the whole block is processed, so a
-      // crash mid-block re-processes that block (safe: notifications are
-      // deduped by the notified-set) rather than skipping its tail of events.
-      // The block's hash is committed with the checkpoint so the next run's
-      // reorg guard has a consistent predecessor to compare against.
-      await this.store.setCheckpoint(n, block.hash);
-      lastProcessed = n;
+      this.log.info(`Scanner caught up to block ${lastProcessed}.`);
     }
 
-    this.log.info(`Scanner caught up to block ${lastProcessed}.`);
+    // Delivery is off the critical path: the block loop above only enqueues to the
+    // outbox, so a slow or down notifier never holds up scanning or the
+    // checkpoint. The drain runs after the loop (even on a no-new-blocks pass, to
+    // retry anything still queued) and is non-fatal — a failing delivery is
+    // retried or dead-lettered, never thrown back into the scan. Set
+    // autoDrain:false to run delivery as a fully separate loop instead.
+    if (this.autoDrain) await this.drainOutbox();
   }
 
   // ── Reorg recovery ─────────────────────────────────────────────────────────
@@ -365,18 +447,21 @@ export class VaultSwapScanner {
   private async processBlock(block: Block): Promise<void> {
     const events = block.logs
       .map((rawLog) => parseLog(rawLog, block.number, this.log))
-      .filter((event): event is SwapEvent => event !== null);
+      .filter((event): event is ProtocolEvent => event !== null);
 
-    // Two passes within the block. A swap's events are causally ordered ACROSS
-    // blocks (it cannot settle before it locks), but the order of logs WITHIN a
-    // single block is not guaranteed to respect that. Recording partials
-    // (SwapRequested / FundsLocked) before handling terminals makes correlation
-    // independent of intra-block log ordering: a terminal that shares a block
-    // with its own prerequisite still sees it, instead of failing to correlate
-    // and deleting the swap's anchor — which would lose the swap permanently.
+    // Two passes within the block. A operation's events are causally ordered
+    // ACROSS blocks (a swap cannot settle before it locks; a loan cannot be
+    // repaid before it is requested), but the order of logs WITHIN a single block
+    // is not guaranteed to respect that. Recording openers (SwapRequested /
+    // FundsLocked / LoanRequested) before handling closers makes correlation
+    // independent of intra-block log ordering: a closer that shares a block with
+    // its own prerequisite still sees it, instead of failing to correlate and
+    // deleting the operation's anchor — which would lose it permanently.
     for (const event of events) {
       if (event.type === 'SwapRequested' || event.type === 'FundsLocked') {
         await this.recordPartial(event);
+      } else if (event.type === 'LoanRequested') {
+        await this.recordLoan(event);
       }
     }
     for (const event of events) {
@@ -386,8 +471,16 @@ export class VaultSwapScanner {
         event.type === 'SwapCancelled'
       ) {
         await this.handleTerminal(event);
+      } else if (event.type === 'LoanRepaid') {
+        await this.handleLoanRepaid(event);
       }
     }
+
+    // A loan default is the absence of a repayment by the deadline, so it has no
+    // log to react to. After this block's events are applied, sweep for loans
+    // whose dueBlock has now been reached and are still outstanding. Running this
+    // every block (even logless ones) is what lets a default fire on time.
+    await this.sweepLoanDefaults(block.number);
   }
 
   private async recordPartial(event: SwapRequestedEvent | FundsLockedEvent): Promise<void> {
@@ -427,23 +520,29 @@ export class VaultSwapScanner {
       return;
     }
 
-    // At-least-once: notify first, then mark + clean up. A crash between
-    // notify() and markNotified() re-emits this one notification on restart,
-    // preferable to at-most-once (losing it). Exactly-once in production comes
-    // from an idempotent notifier keyed on swapId, or a transactional outbox so
-    // notify + markNotified commit atomically.
-    await withRetry(() => this.notifier.notify(notification), {
-      ...this.retry,
-      onRetry: (err, attempt) =>
-        this.log.warn(`notify(${event.swapId}) failed (attempt ${attempt}): ${describe(err)}`),
+    await this.finalizeSwap(notification);
+    this.log.info(`Finalised ${event.swapId} (${notification.outcome}); queued for delivery.`);
+  }
+
+  /**
+   * Seal a swap and enqueue its notification for delivery. Enqueue → mark → clean
+   * up are all local, reliable writes — no notifier call on the critical path. In
+   * production these commit in one transaction with the checkpoint, so advancing
+   * the checkpoint and durably queuing the notification are the same atomic fact
+   * (exactly-once effect). Here the small window makes it at-least-once: the
+   * notified-set seals against re-enqueue, and the consumer dedupes on swapId.
+   */
+  private async finalizeSwap(notification: SwapNotification): Promise<void> {
+    await this.store.enqueueOutbox({
+      key: `swap:${notification.swapId}`,
+      kind: 'swap',
+      notification,
+      attempts: 0,
     });
-
-    // Tag with the settle block so reorg recovery knows whether this emission
+    // Tag with the terminal block so reorg recovery knows whether this emission
     // would be orphaned by a rewind past it.
-    await this.store.markNotified(event.swapId, event.blockNumber);
-    await this.store.deletePending(event.swapId);
-
-    this.log.info(`Emitted notification for ${event.swapId} (${notification.outcome}).`);
+    await this.store.markNotified(notification.swapId, notification.terminal.blockNumber);
+    await this.store.deletePending(notification.swapId);
   }
 
   /**
@@ -511,6 +610,152 @@ export class VaultSwapScanner {
         // also refuses to silently drop the event.
         const unhandled: never = event;
         throw new Error(`Unhandled terminal event type: ${JSON.stringify(unhandled)}`);
+      }
+    }
+  }
+
+  // ── Loans (Part 4) ────────────────────────────────────────────────────────
+
+  private async recordLoan(event: LoanRequestedEvent): Promise<void> {
+    // Already finalised (repaid/defaulted)? A further request log is a duplicate
+    // or straggler — ignore it.
+    if (await this.store.isLoanNotified(event.loanId)) return;
+
+    // First request wins. A re-request for a still-pending loan should be an
+    // identical replay; if it carries a DIFFERENT dueBlock it is a protocol
+    // anomaly (the deadline would silently move and re-time the default), so keep
+    // the original and warn rather than overwrite.
+    const existing = await this.store.getPendingLoan(event.loanId);
+    if (existing) {
+      if (existing.dueBlock !== event.dueBlock) {
+        this.log.warn(
+          `LoanRequested for ${event.loanId} at block ${event.blockNumber} conflicts ` +
+            `with the recorded dueBlock ${existing.dueBlock} (new ${event.dueBlock}); ` +
+            `keeping the original.`,
+        );
+      }
+      return;
+    }
+
+    await this.store.putPendingLoan(event);
+  }
+
+  /**
+   * A repayment finalises a loan as `repaid` only if it lands strictly before the
+   * deadline. A repayment in or after `dueBlock` is too late: the loan has
+   * defaulted (or will, in this same block's sweep), so it is left for the
+   * default path rather than emitted as repaid.
+   */
+  private async handleLoanRepaid(event: LoanRepaidEvent): Promise<void> {
+    if (await this.store.isLoanNotified(event.loanId)) {
+      this.log.warn(`LoanRepaid for ${event.loanId} ignored; loan already finalised.`);
+      return;
+    }
+
+    const requested = await this.store.getPendingLoan(event.loanId);
+    if (!requested) {
+      // No anchor: started mid-loan (request before our scan window), or a
+      // repayment for a loan we never saw requested. Can't build a notification.
+      this.log.warn(
+        `LoanRepaid for ${event.loanId} at block ${event.blockNumber} has no prior ` +
+          `LoanRequested (likely started mid-loan); skipping notification.`,
+      );
+      return;
+    }
+
+    if (event.blockNumber >= requested.dueBlock) {
+      // On or after the deadline → not a valid repayment. Leave it pending so the
+      // per-block default sweep finalises it as defaulted.
+      this.log.warn(
+        `LoanRepaid for ${event.loanId} at block ${event.blockNumber} is at/after ` +
+          `dueBlock ${requested.dueBlock}; too late, treating as default.`,
+      );
+      return;
+    }
+
+    const notification: LoanNotification = {
+      loanId: event.loanId,
+      outcome: 'repaid',
+      requested,
+      repaid: event,
+    };
+    await this.finalizeLoan(notification, event.blockNumber);
+    this.log.info(`Finalised loan ${event.loanId} (repaid); queued for delivery.`);
+  }
+
+  /**
+   * Finalise a `defaulted` notification for every outstanding loan whose deadline
+   * has been reached at `blockNumber`. Defaults are deduped by the notified-loan
+   * set, so re-running this after a crash/replay is safe. Each default is enqueued
+   * to the outbox, not delivered here, so an undeliverable default never stalls
+   * the sweep, the block, or anything behind it.
+   */
+  private async sweepLoanDefaults(blockNumber: number): Promise<void> {
+    const due = await this.store.loansDueBy(blockNumber);
+    for (const loan of due) {
+      if (await this.store.isLoanNotified(loan.loanId)) continue;
+      const notification: LoanNotification = {
+        loanId: loan.loanId,
+        outcome: 'defaulted',
+        requested: loan,
+      };
+      await this.finalizeLoan(notification, blockNumber);
+      this.log.info(
+        `Finalised loan ${loan.loanId} (defaulted; dueBlock ${loan.dueBlock} ` +
+          `reached); queued for delivery.`,
+      );
+    }
+  }
+
+  /**
+   * Loan counterpart of finalizeSwap: enqueue → mark → clean up, all local.
+   * `finalizeBlock` is the block the loan was finalised at (the repayment block,
+   * or the sweep block for a default), tagged on the notified record so reorg
+   * recovery knows whether a rewind would orphan this emission.
+   */
+  private async finalizeLoan(notification: LoanNotification, finalizeBlock: number): Promise<void> {
+    await this.store.enqueueOutbox({
+      key: `loan:${notification.loanId}`,
+      kind: 'loan',
+      notification,
+      attempts: 0,
+    });
+    await this.store.markLoanNotified(notification.loanId, finalizeBlock);
+    await this.store.deletePendingLoan(notification.loanId);
+  }
+
+  // ── Outbox delivery (off the critical path) ─────────────────────────────────
+
+  /**
+   * Deliver queued notifications. Public so a scheduler can run delivery as its
+   * own loop, independent of scanning. Each entry is attempted once per call;
+   * repeated calls are the retry mechanism. A delivery failure is caught (never
+   * thrown back to the caller), counted, and — once it has failed
+   * `maxDeliveryAttempts` times — moved to the dead-letter queue so one
+   * undeliverable notification cannot block the rest of the queue.
+   */
+  async drainOutbox(): Promise<void> {
+    const pending = await this.store.peekOutbox();
+    for (const entry of pending) {
+      try {
+        if (entry.kind === 'swap') {
+          await this.notifier.notify(entry.notification as SwapNotification);
+        } else {
+          await this.notifier.notifyLoan(entry.notification as LoanNotification);
+        }
+        await this.store.markDelivered(entry.key);
+        this.log.info(`Delivered ${entry.key}.`);
+      } catch (err) {
+        const attempts = entry.attempts + 1;
+        await this.store.recordOutboxAttempt(entry.key);
+        this.log.warn(
+          `Delivery of ${entry.key} failed (attempt ${attempts}/` +
+            `${this.maxDeliveryAttempts}): ${describe(err)}`,
+        );
+        if (attempts >= this.maxDeliveryAttempts) {
+          await this.store.moveToDeadLetter(entry.key);
+          this.log.error(`Dead-lettered ${entry.key} after ${attempts} failed attempts.`);
+        }
       }
     }
   }
